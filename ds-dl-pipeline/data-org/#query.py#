@@ -1,0 +1,244 @@
+import pandas as pd
+import numpy as np
+import io
+import boto3
+import sys
+sys.path.insert(1, '/usr/local/lib/python3.9/site-packages/')
+from combat.pycombat import pycombat
+
+def read_csv_from_s3(bucket, path):
+    """
+    reads an individual parquet file into memory as a pandas dataframe
+
+    Parameters
+    ----------
+    bucket: string - name of S3 bucket
+    path: string - subdirectory location of interest within bucket 
+    name: string - name of .csv file
+
+    Returns
+    -------
+    df: pd.DataFrame - imported .csv file
+    """
+    s3 = boto3.client('s3')
+    obj = s3.get_object(Bucket=bucket, Key=path)
+    df = pd.read_csv(io.BytesIO(obj['Body'].read()))
+    return df    
+
+def binarize_column_labels(dataset, column, class1, class0):
+    dataset.loc[dataset[column] == class1, column] = 1
+    dataset.loc[dataset[column] == class0, column] = 0
+    try:
+        dataset[column] = dataset[column].astype(int)
+    except:
+        print('cant convert column to int')
+        try:
+            dataset[column] = dataset[column].astype(float)
+        except:
+            print('cant convert column to float')
+    return dataset
+
+def binarize_column_dic(data, dic):
+    for item in dic.keys():
+        data = binarize_column_labels(data, item, dic[item][0], dic[item][1])
+    return data
+
+def aws_get_patient_list(bucket, path, patient_lists):
+    patient_ids = read_csv_from_s3(bucket, path)
+    patients = []
+    for item in patient_lists:
+        patients = patients+patient_ids[item].dropna().tolist()
+    return patients
+
+def local_get_patient_list(path, patient_lists):
+    patient_ids = pd.read_csv(path)
+    patients = []
+    for item in patient_lists:
+        patients = patients+patient_ids[item].dropna().tolist()
+    return patients
+
+def get_patient_list(location, path, patient_lists, bucket = ''):
+    if location == 'aws':
+        patients = aws_get_patient_list(bucket, path, patient_lists)
+    if location == 'local':
+        patients = local_get_patient_list(path, patient_lists)
+    patients = list(set(patients))
+    return patients
+
+def aws_open_database(bucket, path):
+    data = read_csv_from_s3(bucket, path)
+    data.index = data.parameter
+    return data
+
+def local_open_database(path):
+    data = pd.read_csv(path)
+    data.index = data.parameter
+    return data
+
+def open_database(location, path, bucket = ''):
+    if location == 'aws':
+        data = aws_open_database(bucket, path)
+    if location == 'local':
+        data = local_open_database(path)
+    data = check_dtypes(data)
+    data = data.loc[data['visit'] != 'na']
+    data = data.loc[data['biologic_cycle'] != 'na']
+    data['visit'] = data['visit'].astype(int)
+    data['biologic_cycle'] = data['biologic_cycle'].astype(float).astype(int)
+    return data
+
+def local_get_features(path, lists, extra):
+    fts = pd.read_csv(path)
+    features = []
+    for item in lists:
+        features = features+fts[item].dropna().tolist()
+    features = features+extra
+    return features
+
+def aws_get_features(bucket, path, lists, extra):
+    fts = read_csv_from_s3(bucket, path)
+    features = []
+    for item in lists:
+        features = features+fts[item].dropna().tolist()
+    features = features+extra
+    return features
+
+def get_features(lists, extra, location='aws', path='data-organization/parameters/features.csv', bucket = 'sm-ds-datalake'):
+    if location == 'aws':
+        features = aws_get_features(bucket, path, lists, extra)
+    if location == 'local':
+        features = local_get_features(path, lists, extra)
+    return features
+
+def select_patients(data, patients):
+    data = data[patients]
+    return data
+
+def select_parameters(data, features):
+    data = data.loc[features]
+    return data
+
+def check_dtypes(data):
+    data['visit'] = data['visit'].replace('na', np.nan, regex=True)
+    data['visit'] = data.visit.astype(float)
+    return data
+
+def selects(data, sel_dic):
+    for item in sel_dic.keys():
+        data = data.loc[data[item] == sel_dic[item]]
+    return data
+
+def convert_col_name(data, old_name, new_name):
+    data = data.rename(columns={old_name: new_name})
+    return data
+
+def format_data(data, prms):
+    data = data.T
+    data = convert_col_name(data, prms['endpoint']['parameter'], 'Class')
+    data = binarize_column_dic(data, prms['binarize'])
+    return data
+
+def org_q(query):
+    select = {}        
+    for cycle in query['cycles'].keys():
+        for tp in query['cycles'][cycle]:
+            ends = {}
+            for endpoint in query['endpoints']['endpoints']:
+                for offset in query['endpoints']['offsets']:
+                    ends.setdefault(endpoint, []).append(offset)
+            tag = 'cycle'+str(cycle)+'_'+str(tp)+'m'
+            select.update({tag: {'data': {'genes': [query['features']['genes'], int(cycle), tp],
+                                          'clinical': [query['features']['clinical'], int(cycle), tp]},
+                                 'endpoint': ends}})
+    return select
+
+def organize_query(query):
+    query_ = {}
+    query_.update({'database': {'location': query['database']['location'],
+                                'path': query['database']['path'],
+                                'bucket': 'sm-ds-datalake'}})
+    select = org_q(query)
+    query_.update({'query':select})
+    return query_
+
+def get_endpoints(data, cycle, tp, endpoints):
+    ends = []
+    for endpoint in endpoints.keys():
+        for offset in endpoints[endpoint]:
+            end = selects(data, {'parameter': endpoint,
+                                 'biologic_cycle': cycle,
+                                 'feature_type': 'derived',
+                                 'visit': tp+offset})
+            end.index = [endpoint+'+'+str(offset)]
+            ends.append(end)
+    ends = pd.concat(ends)
+    ends['parameter'] = ends.index
+    return ends
+
+def get_some_data(data, feature_type, sel, extra=[]):
+    data = select_parameters(data, get_features(sel['data'][feature_type][0], extra))
+    data = selects(data, {'biologic_cycle': sel['data'][feature_type][1],
+                          'visit': sel['data'][feature_type][2]})
+    return data
+
+def get_endpoints_clin_genes(data, cycle, tp, sel):
+    endpoints = get_endpoints(data, cycle, tp, sel['endpoint'])
+    clinical = get_some_data(data, 'clinical', sel)
+    clinical['feature_type'] = 'clinical'
+    genes = get_some_data(data, 'genes', sel, ['FACILITY'])
+    data = pd.concat([endpoints, clinical, genes])
+    data = data.set_index(['parameter', 'feature_type'])
+    data = data.iloc[:,5:].T    
+    return data
+    
+def select(data, sel, query):
+    cycle = sel['data']['genes'][1]
+    tp = sel['data']['genes'][2]
+    data = get_endpoints_clin_genes(data, cycle, tp, sel)
+    data.insert(0, 'Query', query)
+    data = data.dropna(subset = [('FACILITY', 'RNA')])
+    return data
+
+def selection(data, selection):
+    data_ = []
+    for item in selection.keys():
+        data_.append(select(data, selection[item], item))
+    data_ = pd.concat(data_)
+    return data_
+
+def select_data(query):
+    prms = organize_query(query)
+    data = open_database(**prms['database'])
+    data = selection(data, prms['query'])
+    data = format_facility(data)
+    return data
+
+def format_facility(data):
+    Q2 = data.loc[data[('FACILITY', 'RNA')].squeeze().str.contains('Sample', na=False)]
+    Q2[('FACILITY', 'RNA')] = 'Q2'
+    Ambry = data.loc[~data[('FACILITY', 'RNA')].squeeze().str.contains('Sample', na=False)]
+    Ambry[('FACILITY', 'RNA')] = 'Ambry'
+    data = pd.concat([Q2, Ambry])
+    data.insert(0, 'Facility', data[('FACILITY', 'RNA')].squeeze())
+    data = data.drop(['FACILITY'], axis=1)
+    return data
+
+def get_matrix(data, feature_type):
+    data = data.iloc[:, data.columns.get_level_values('feature_type')==feature_type]
+    return data
+    
+def get_batches(data, column, batch_dic):
+    batch = data[[column]]
+    for item in batch_dic.keys():
+        batch.loc[batch[column] == item, 'batch'] = batch_dic[item]
+    batch = batch['batch'].tolist()
+    return batch
+
+def binarize_column_labels(dataset, column, class1, class0):
+    dataset.loc[dataset[column] == class1, column] = 1
+    dataset.loc[dataset[column] == class0, column] = 0
+    try:
+        dataset[column] = dataset[column].astype(float)
+    except:
+        print('cant convert column to float')
+    return dataset
